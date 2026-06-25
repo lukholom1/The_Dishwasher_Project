@@ -1,0 +1,475 @@
+/*
+ * ============================================================
+ *  DISHWASHER CONTROLLER - ESP32-S2
+ *  Full 1-hour wash cycle simulated in 2 minutes
+ * ============================================================
+ *  PIN ASSIGNMENTS
+ *  Relay 1  -> pin 1   -> Water Inlet Solenoid  (TOP)
+ *  Relay 2  -> pin 3   -> Drain Pump            (TOP)
+ *  Relay 3  -> pin 20  -> Wash Motor            (BOTTOM)
+ *  Relay 4  -> pin 18  -> Heating Element       (BOTTOM)
+ *  DS18B20  -> pin 46  -> Temperature Sensor
+ *  SSD1306  -> SDA 35, SCL 36 -> OLED Display
+ *  Switch   -> pin 5   -> Water Level Switch
+ *  Button   -> pin 7   -> Start / Stop (one leg to D7, other to GND)
+ *
+ *  CYCLE PHASES (real time -> simulated 2 min scale)
+ *  1. Pre-Wash   :  5 min real ->  10 s sim
+ *  2. Main Wash  : 25 min real ->  50 s sim  (heat 55C)
+ *  3. Rinse 1    :  5 min real ->  10 s sim
+ *  4. Hot Rinse  : 15 min real ->  30 s sim  (heat 90C)
+ *  5. Drain      :  5 min real ->  10 s sim
+ *  6. Dry        :  5 min real ->  10 s sim  (PASSIVE)
+ *  TOTAL         : 60 min real -> 120 s sim
+ *
+ *  LIBRARIES REQUIRED:
+ *  - Adafruit SSD1306
+ *  - Adafruit GFX Library
+ *  - OneWire
+ *  - DallasTemperature
+ * ============================================================
+ */
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ---- Pin definitions ----
+#define PIN_SOLENOID   1
+#define PIN_DRAIN      3
+#define PIN_MOTOR      20
+#define PIN_HEATER     18
+#define PIN_TEMP       46
+#define PIN_LEVEL      5
+#define PIN_BUTTON     7
+#define PIN_SAFETY     8    // Safety cut-off: must stay LOW (connected to GND)
+#define OLED_SDA       35
+#define OLED_SCL       36
+#define OLED_VCC       37
+
+// ---- OLED ----
+#define SCREEN_W  128
+#define SCREEN_H  64
+#define OLED_ADDR 0x3C
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+
+// ---- Temperature sensor ----
+OneWire oneWire(PIN_TEMP);
+DallasTemperature sensors(&oneWire);
+
+#define SCALE_FACTOR 30.0f
+
+// ---- Phase definition ----
+struct Phase {
+  const char* name;
+  uint16_t    duration_s;
+  bool        solenoid;
+  bool        drain;
+  bool        motor;
+  bool        heater;
+  float       targetTemp;
+  bool        waitForFill;
+};
+
+Phase phases[] = {
+  { "PRE-WASH",   10, true,  false, true,  false,  0,   true  },
+  { "MAIN WASH",  50, true,  false, true,  true,  55.0, true  },
+  { "RINSE 1",    10, true,  false, true,  false,  0,   true  },
+  { "HOT RINSE",  30, true,  false, true,  true,  90.0, true  },
+  { "DRAIN",      10, false, true,  false, false,  0,   false },
+  { "DRY",        10, false, false, false, false,  0,   false },
+};
+
+const uint8_t NUM_PHASES = sizeof(phases) / sizeof(phases[0]);
+
+typedef enum {
+  STATE_IDLE,
+  STATE_RUNNING,
+  STATE_PAUSED,
+  STATE_COMPLETE
+} MachineState;
+
+// ---- Global state ----
+MachineState machineState  = STATE_IDLE;
+uint8_t      currentPhase  = 0;
+uint32_t     phaseStart    = 0;
+uint32_t     pausedElapsed = 0;
+float        currentTemp   = 20.0;
+bool         levelHigh     = false;
+
+// ---- Button state (debounce) ----
+bool     btnPrev           = HIGH;  // last stable reading
+uint32_t btnDebounceTime   = 0;
+bool     btnStable         = HIGH;  // debounced stable state
+#define  DEBOUNCE_MS       50
+
+#define RELAY_ON  HIGH
+#define RELAY_OFF LOW
+
+// ============================================================
+void setRelays(bool sol, bool drn, bool mtr, bool htr) {
+  digitalWrite(PIN_SOLENOID, sol ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_DRAIN,    drn ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_MOTOR,    mtr ? RELAY_ON : RELAY_OFF);
+  digitalWrite(PIN_HEATER,   htr ? RELAY_ON : RELAY_OFF);
+}
+
+void allRelaysOff() {
+  setRelays(false, false, false, false);
+}
+
+// ============================================================
+uint32_t totalSimSeconds() {
+  uint32_t t = 0;
+  for (uint8_t i = 0; i < NUM_PHASES; i++) t += phases[i].duration_s;
+  return t;
+}
+
+uint32_t elapsedSimSeconds() {
+  uint32_t t = 0;
+  for (uint8_t i = 0; i < currentPhase; i++) t += phases[i].duration_s;
+  if (machineState == STATE_RUNNING) {
+    t += pausedElapsed + (millis() - phaseStart) / 1000;
+  } else {
+    t += pausedElapsed;
+  }
+  return t;
+}
+
+// ============================================================
+float simulateTemp(float current, bool heaterOn, float target) {
+  float ambient = 20.0;
+  if (heaterOn && target > 0) {
+    current += 0.5;
+    if (current > target) current = target;
+  } else {
+    if (current > ambient) {
+      current -= 0.1;
+      if (current < ambient) current = ambient;
+    }
+  }
+  return current;
+}
+
+// ============================================================
+void updateDisplay(const char* phaseName, float temp, uint8_t phaseNum,
+                   uint32_t elapsed_s, uint32_t total_s,
+                   bool sol, bool drn, bool mtr, bool htr) {
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+
+  if (machineState == STATE_IDLE) {
+    display.setTextSize(2);
+    display.setCursor(10, 8);
+    display.println("DISHWASH");
+    display.setTextSize(1);
+    display.setCursor(10, 36);
+    display.println("Controller v1.0");
+    display.setCursor(10, 50);
+    display.println("Press BTN to start");
+    display.display();
+    return;
+  }
+
+  if (machineState == STATE_COMPLETE) {
+    display.setTextSize(2);
+    display.setCursor(20, 8);
+    display.println("CYCLE");
+    display.setCursor(20, 28);
+    display.println("DONE!");
+    display.setTextSize(1);
+    display.setCursor(10, 52);
+    display.println("Press BTN to reset");
+    display.display();
+    return;
+  }
+
+  // Header
+  display.setCursor(0, 0);
+  display.print("DISHWASHER  ");
+  display.print(phaseNum);
+  display.print("/");
+  display.print(NUM_PHASES);
+
+  // Phase name / paused
+  display.setCursor(0, 12);
+  if (machineState == STATE_PAUSED) {
+    display.print("!! PAUSED !!");
+  } else {
+    display.print("Phase: ");
+    display.print(phaseName);
+  }
+
+  // Progress bar
+  uint8_t barW = (uint8_t)map(elapsed_s, 0, total_s, 0, 120);
+  barW = constrain(barW, 0, 120);
+  display.drawRect(4, 23, 120, 7, SSD1306_WHITE);
+  display.fillRect(4, 23, barW, 7, SSD1306_WHITE);
+
+  // Time remaining
+  uint32_t phaseSpent = pausedElapsed;
+  if (machineState == STATE_RUNNING) phaseSpent += (millis() - phaseStart) / 1000;
+  int32_t remaining = (int32_t)phases[currentPhase].duration_s - (int32_t)phaseSpent;
+  if (remaining < 0) remaining = 0;
+  uint32_t realMin = (uint32_t)(remaining * SCALE_FACTOR) / 60;
+  uint32_t realSec = (uint32_t)(remaining * SCALE_FACTOR) % 60;
+
+  display.setCursor(0, 33);
+  display.print("Time left: ");
+  if (realMin < 10) display.print("0");
+  display.print(realMin);
+  display.print(":");
+  if (realSec < 10) display.print("0");
+  display.print(realSec);
+
+  // Temperature
+  display.setCursor(0, 43);
+  display.print("Temp: ");
+  display.print((int)temp);
+  display.print((char)247);
+  display.print("C");
+
+  // I/O status
+  display.setCursor(0, 54);
+  if (machineState == STATE_PAUSED) {
+    display.print("-- ALL RELAYS OFF --");
+  } else if (strcmp(phaseName, "DRY") == 0) {
+    display.print("** PASSIVE DRY **");
+  } else {
+    if (sol) display.print("SOL "); else display.print("--- ");
+    if (drn) display.print("DRN "); else display.print("--- ");
+    if (mtr) display.print("MTR "); else display.print("--- ");
+    if (htr) display.print("HTR");  else display.print("---");
+  }
+
+  display.display();
+}
+
+// ============================================================
+void logState(const char* phaseName, float temp,
+              bool sol, bool drn, bool mtr, bool htr, bool level) {
+  Serial.print("[");
+  Serial.print(millis() / 1000);
+  Serial.print("s] ");
+  Serial.print(phaseName);
+  Serial.print(" | Temp:");
+  Serial.print(temp, 1);
+  Serial.print("C | SOL:");
+  Serial.print(sol ? "ON" : "off");
+  Serial.print(" DRN:");
+  Serial.print(drn ? "ON" : "off");
+  Serial.print(" MTR:");
+  Serial.print(mtr ? "ON" : "off");
+  Serial.print(" HTR:");
+  Serial.print(htr ? "ON" : "off");
+  Serial.print(" LVL:");
+  Serial.println(level ? "FULL" : "LOW");
+}
+
+// ============================================================
+// Returns true ONCE per physical button press (clean falling-edge detect)
+bool buttonPressed() {
+  bool reading = digitalRead(PIN_BUTTON);
+
+  // Reset debounce timer whenever the raw reading changes
+  if (reading != btnPrev) {
+    btnDebounceTime = millis();
+    btnPrev = reading;
+  }
+
+  // Only update stable state after signal has been steady for DEBOUNCE_MS
+  if ((millis() - btnDebounceTime) >= DEBOUNCE_MS) {
+    if (reading != btnStable) {
+      btnStable = reading;
+      // Fire on the falling edge (HIGH -> LOW = button pressed)
+      if (btnStable == LOW) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// ============================================================
+void resetCycle() {
+  currentPhase  = 0;
+  phaseStart    = 0;
+  pausedElapsed = 0;
+  currentTemp   = 20.0;
+  machineState  = STATE_IDLE;
+  allRelaysOff();
+  Serial.println("=== RESET - READY ===");
+}
+
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("=== DISHWASHER CONTROLLER BOOT ===");
+
+  pinMode(OLED_VCC, OUTPUT);
+  digitalWrite(OLED_VCC, HIGH);
+  delay(50);
+
+  pinMode(PIN_SOLENOID, OUTPUT);
+  pinMode(PIN_DRAIN,    OUTPUT);
+  pinMode(PIN_MOTOR,    OUTPUT);
+  pinMode(PIN_HEATER,   OUTPUT);
+  allRelaysOff();
+
+  pinMode(PIN_LEVEL,  INPUT_PULLUP);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_SAFETY, INPUT_PULLUP);  // Must read LOW during operation
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    Serial.println("ERROR: SSD1306 not found");
+    while (true) delay(1000);
+  }
+
+  sensors.begin();
+
+  updateDisplay("", 20.0, 0, 0, totalSimSeconds(), false, false, false, false);
+  Serial.println("Ready. Press button to start.");
+}
+
+// ============================================================
+void loop() {
+
+  // ---- SAFETY CUT-OFF (pin 8 must stay connected to GND) ----
+  // Pull-up means pin reads HIGH if connection is lost -> emergency stop
+  if (digitalRead(PIN_SAFETY) == HIGH && machineState == STATE_RUNNING) {
+    allRelaysOff();
+    machineState = STATE_PAUSED;  // hold in paused so display shows state
+    // Override display immediately
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(2);
+    display.setCursor(10, 0);
+    display.println("!! SAFETY");
+    display.setCursor(10, 20);
+    display.println("STOP !!");
+    display.setTextSize(1);
+    display.setCursor(0, 44);
+    display.println("Pin 8 lost GND");
+    display.setCursor(0, 54);
+    display.println("Check connection");
+    display.display();
+    Serial.println("!!! SAFETY TRIGGERED - PIN 8 LOST GND - ALL RELAYS OFF !!!");
+    // Block here until pin 8 is restored
+    while (digitalRead(PIN_SAFETY) == HIGH) {
+      delay(100);
+    }
+    // GND restored — resume
+    Serial.println(">>> Safety cleared - resuming");
+    phaseStart   = millis();
+    machineState = STATE_RUNNING;
+  }
+
+  // ---- Button check (runs every loop iteration) ----
+  if (buttonPressed()) {
+    Serial.println("BTN PRESSED");
+    switch (machineState) {
+      case STATE_IDLE:
+        currentPhase  = 0;
+        pausedElapsed = 0;
+        phaseStart    = millis();
+        machineState  = STATE_RUNNING;
+        Serial.println("=== CYCLE STARTED ===");
+        Serial.print("Phase 1: ");
+        Serial.println(phases[0].name);
+        break;
+
+      case STATE_RUNNING:
+        pausedElapsed += (millis() - phaseStart) / 1000;
+        machineState   = STATE_PAUSED;
+        allRelaysOff();
+        Serial.println(">>> PAUSED");
+        break;
+
+      case STATE_PAUSED:
+        phaseStart   = millis();
+        machineState = STATE_RUNNING;
+        Serial.println(">>> RESUMED");
+        break;
+
+      case STATE_COMPLETE:
+        resetCycle();
+        break;
+    }
+  }
+
+  // ---- Idle ----
+  if (machineState == STATE_IDLE) {
+    updateDisplay("", currentTemp, 0, 0, totalSimSeconds(),
+                  false, false, false, false);
+    delay(50);
+    return;
+  }
+
+  // ---- Complete ----
+  if (machineState == STATE_COMPLETE) {
+    updateDisplay("", currentTemp, NUM_PHASES, totalSimSeconds(), totalSimSeconds(),
+                  false, false, false, false);
+    delay(50);
+    return;
+  }
+
+  // ---- Paused ----
+  if (machineState == STATE_PAUSED) {
+    Phase& p = phases[currentPhase];
+    updateDisplay(p.name, currentTemp, currentPhase + 1,
+                  elapsedSimSeconds(), totalSimSeconds(),
+                  false, false, false, false);
+    delay(50);
+    return;
+  }
+
+  // ---- Running ----
+  Phase& p = phases[currentPhase];
+
+  levelHigh   = (digitalRead(PIN_LEVEL) == LOW);
+  currentTemp = simulateTemp(currentTemp, p.heater, p.targetTemp);
+  bool solActive = p.solenoid && !levelHigh;
+
+  setRelays(solActive, p.drain, p.motor, p.heater);
+
+  // Phase transition
+  uint32_t phaseSpent = pausedElapsed + (millis() - phaseStart) / 1000;
+  bool canAdvance = (phaseSpent >= p.duration_s);
+  if (p.waitForFill && !levelHigh) canAdvance = false;
+
+  if (canAdvance) {
+    allRelaysOff();
+    currentPhase++;
+    pausedElapsed = 0;
+
+    if (currentPhase >= NUM_PHASES) {
+      machineState = STATE_COMPLETE;
+      Serial.println("=== CYCLE COMPLETE ===");
+      return;
+    }
+
+    phaseStart = millis();
+    Serial.print(">>> Phase ");
+    Serial.print(currentPhase + 1);
+    Serial.print(": ");
+    Serial.println(phases[currentPhase].name);
+  }
+
+  updateDisplay(p.name, currentTemp, currentPhase + 1,
+                elapsedSimSeconds(), totalSimSeconds(),
+                solActive, p.drain, p.motor, p.heater);
+
+  static uint32_t lastLog = 0;
+  if (millis() - lastLog >= 2000) {
+    logState(p.name, currentTemp, solActive, p.drain, p.motor, p.heater, levelHigh);
+    lastLog = millis();
+  }
+
+  delay(50);  // reduced from 100ms for faster button polling
+}
